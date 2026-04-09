@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+asmjson = "0.2.6"
+fancy-regex = "0.14"
+memmap2 = "0.9"
+ndarray = "0.16"

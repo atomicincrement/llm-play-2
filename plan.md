@@ -1,24 +1,25 @@
-# LLaMA 3 from Scratch in Rust — Implementation Plan
+# Transformer LLM from Scratch in Rust — Implementation Plan
 
-**Stack:** `ndarray` (tensor math via BLAS), `asmjson` (SIMD JSON parsing for safetensors headers)  
-**Target model:** `meta-llama/Llama-3.2-1B` — the smallest available LLaMA 3 checkpoint.
+**Stack:** `ndarray` (tensor math via BLAS), `serde_json` (JSON parsing), `memmap2` (zero-copy file mapping)  
+**Target model:** `Qwen/Qwen2.5-0.5B`
 
 ---
 
 ## Where to get the weights
 
-The smallest LLaMA 3 model is **Llama-3.2-1B** (1 billion parameters).
+Using **Qwen2.5-0.5B** (0.5 billion parameters) from ModelScope.
 
-1. Accept the Meta license at: https://huggingface.co/meta-llama/Llama-3.2-1B
-2. Download with:
-   ```
-   huggingface-cli download meta-llama/Llama-3.2-1B \
-       --local-dir ./weights/Llama-3.2-1B
-   ```
-3. Key files you will use:
-   - `model.safetensors` — raw weight tensors (JSON header + binary blob)
-   - `config.json` — model hyperparameters (hidden size, layers, heads, etc.)
-   - `tokenizer.json` — BPE vocab and merge rules
+```
+python -c "
+from modelscope.hub.snapshot_download import snapshot_download
+snapshot_download('Qwen/Qwen2.5-0.5B', local_dir='./models/Qwen2.5-0.5B')
+"
+```
+
+Key files:
+- `model.safetensors` — raw weight tensors (all BF16)
+- `config.json` — model hyperparameters
+- `tokenizer.json` — BPE vocab and merge rules
 
 ---
 
@@ -30,13 +31,12 @@ Each step below is self-contained and can be turned into its own prompt.
 
 ### Step 1 — Project setup and dependencies
 
-Add `ndarray`, `ndarray-linalg`, and `asmjson` to `Cargo.toml`.  
-Pin `ndarray-linalg` to the OpenBLAS backend for pure-CPU inference.  
+Add `ndarray`, `memmap2`, and `serde_json` to `Cargo.toml`.  
 Confirm the project builds with a `Hello, world!` smoke test.
 
 ---
 
-### Step 2 — Safetensors loader using asmjson
+### Step 2 — Safetensors loader using serde_json ✅
 
 Safetensors files begin with an 8-byte little-endian length prefix followed by
 a UTF-8 JSON header, then a binary data blob.
@@ -44,50 +44,52 @@ a UTF-8 JSON header, then a binary data blob.
 Implement `load_safetensors(path: &Path) -> HashMap<String, ArrayD<f32>>`:
 - `mmap` the file with the `memmap2` crate.
 - Read the 8-byte header length.
-- Use `asmjson::dom_parser()` to parse the JSON header into a flat `Dom`.
-- For each tensor entry, read `dtype`, `shape`, and `data_offsets` from the tape
-  using a single-pass `object_iter` scan (cache the three field refs).
+- Use `serde_json::from_str` to parse the JSON header.
+- For each tensor entry, read `dtype`, `shape`, and `data_offsets`.
 - Slice the binary region at `data_offsets` and copy/cast into an
-  `ndarray::ArrayD<f32>`.
+  `ndarray::ArrayD<f32>`. BF16 and F16 are promoted to F32 on load.
 
 ---
 
-### Step 3 — Config loader using asmjson
+### Step 3 — Config loader using serde_json ✅
 
-Implement `LlamaConfig` (plain struct with public fields) and
-`LlamaConfig::from_json(src: &str) -> LlamaConfig`:
-- Use `asmjson::dom_parser()` to parse `config.json`.
+Implement `ModelConfig` (plain struct with public fields) and
+`ModelConfig::from_file(path: &Path) -> ModelConfig`:
+- Use `serde_json::from_str` to parse `config.json`.
 - Extract: `hidden_size`, `intermediate_size`, `num_hidden_layers`,
   `num_attention_heads`, `num_key_value_heads`, `rms_norm_eps`,
-  `rope_theta`, `vocab_size`, `max_position_embeddings`.
+  `rope_theta`, `vocab_size`, `max_position_embeddings`,
+  `bos_token_id`, `eos_token_id`, `sliding_window`, `use_sliding_window`.
 
 ---
 
-### Step 4 — BPE tokenizer (encode + decode)
+### Step 4 — BPE tokenizer (encode + decode) ✅
 
 Implement a minimal byte-pair encoding tokenizer from `tokenizer.json`:
-- Parse the file with `asmjson` to extract `vocab` (token→id map) and
+- Parse the file with `serde_json` to extract `vocab` (token→id map) and
   `merges` (ordered list of byte-pair rules).
 - Implement `encode(text: &str) -> Vec<u32>` using the standard BPE greedy merge loop.
 - Implement `decode(ids: &[u32]) -> String` by reverse-lookup and byte-to-UTF-8 healing.
-- Add the LLaMA 3 special tokens: `<|begin_of_text|>` (128000),
-  `<|end_of_text|>` (128001), etc.
+- Add the Qwen2.5 special tokens: `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`, etc.
 
 ---
 
-### Step 5 — RMS Norm
+### Step 5 — RMS Norm ✅
 
-Implement `fn rms_norm(x: ArrayView1<f32>, weight: ArrayView1<f32>, eps: f32) -> Array1<f32>`:
+Implement `fn rms_norm(x: ArrayView1<f32>, weight: ArrayView1<f32>, eps: f32) -> Array1<f32>`
+in `src/norm.rs`:
 
 $$\text{RMSNorm}(x)_i = \frac{x_i}{\sqrt{\frac{1}{d}\sum_j x_j^2 + \varepsilon}} \cdot w_i$$
 
-Use `ndarray` element-wise operations; no loops.
+Use `ndarray` element-wise operations (`dot`, scalar multiply, broadcast) with `f32::sqrt`; no loops.
 
 ---
 
-### Step 6 — Rotary Position Encoding (RoPE)
+### Step 6 — Rotary Position Encoding (RoPE) ✅
 
-Implement `fn apply_rope(xq: ArrayViewMut2<f32>, xk: ArrayViewMut2<f32>, pos: usize, head_dim: usize, theta: f32)`:
+Implemented in `src/rope.rs`.
+
+`fn apply_rope(xq: ArrayViewMut2<f32>, xk: ArrayViewMut2<f32>, pos: usize, head_dim: usize, base: f32)`:
 - Precompute the frequency table:
   $\theta_i = \text{theta}^{-2i/d}$ for $i \in [0, d/2)$.
 - At each position $p$, split each head vector into pairs and apply the 2D rotation:
@@ -96,11 +98,11 @@ $$\begin{pmatrix} x' \\ y' \end{pmatrix} = \begin{pmatrix} \cos(p\theta_i) & -\s
 
 ---
 
-### Step 7 — Grouped-Query Attention (GQA)
+### Step 7 — Grouped-Query Attention (GQA) ✅
 
-LLaMA 3 uses grouped-query attention: `num_key_value_heads` < `num_attention_heads`.
+Implemented in `src/attention.rs`.
 
-Implement `fn attention(x: ArrayView2<f32>, layer: &AttentionWeights, pos: usize, kv_cache: &mut KvCache, cfg: &LlamaConfig) -> Array2<f32>`:
+`fn attention(x: ArrayView1<f32>, w: &AttentionWeights, pos: usize, kv_cache: &mut KvCache, cfg: &ModelConfig) -> Array1<f32>`:
 - Project to Q, K, V with `wq`, `wk`, `wv` weight matrices (ndarray `dot`).
 - Apply RoPE to Q and K.
 - Append K, V slices to the KV cache (a `Vec<Array2<f32>>` per layer).
@@ -115,9 +117,9 @@ $$\text{scores} = \frac{QK^T}{\sqrt{d_k}}$$
 
 ---
 
-### Step 8 — SwiGLU Feed-Forward Network
+### Step 8 — SwiGLU Feed-Forward Network ✅
 
-LLaMA 3 uses the SwiGLU activation:
+Qwen2.5 uses the SwiGLU activation:
 
 $$\text{FFN}(x) = (\text{SiLU}(xW_\text{gate}) \odot xW_\text{up}) \cdot W_\text{down}$$
 
@@ -127,7 +129,7 @@ Implement `fn feed_forward(x: ArrayView1<f32>, layer: &FfnWeights) -> Array1<f32
 
 ---
 
-### Step 9 — Transformer block and full model
+### Step 9 — Transformer block and full model ✅
 
 Assemble one `TransformerBlock::forward`:
 1. `residual = x`
@@ -137,7 +139,7 @@ Assemble one `TransformerBlock::forward`:
 5. `x = rms_norm(x, ffn_norm_weight)`
 6. `x = feed_forward(x, ...) + residual`
 
-Then implement `LlamaModel::forward(token_ids: &[u32]) -> Array2<f32>`:
+Then implement `QwenModel::forward(token_ids: &[u32]) -> Array2<f32>`:
 - Embed tokens via the embedding table (row-index lookup).
 - Run through all `num_hidden_layers` blocks with the shared KV cache.
 - Apply final RMS norm.
@@ -145,7 +147,7 @@ Then implement `LlamaModel::forward(token_ids: &[u32]) -> Array2<f32>`:
 
 ---
 
-### Step 10 — Sampling and inference loop
+### Step 10 — Sampling and inference loop ✅
 
 Implement `fn sample_top_p(logits: ArrayView1<f32>, top_p: f32, temperature: f32) -> u32`:
 - Divide logits by temperature, softmax, sort descending.
@@ -164,8 +166,8 @@ while last_token != EOS && tokens.len() < max_len:
 
 ---
 
-### Step 11 — End-to-end test
+### Step 11 — End-to-end test ✅
 
-Load `Llama-3.2-1B` weights, prompt with `"The capital of France is"`,
+Load `Qwen2.5-0.5B` weights, prompt with `"The capital of France is"`,
 and verify the next token is `" Paris"`.  
 Measure tokens/sec on a single CPU core as a baseline.
