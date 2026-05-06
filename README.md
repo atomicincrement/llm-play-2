@@ -178,38 +178,44 @@ No deep-learning framework, no Python bindings, no GPU runtime.
 
 ### 1 — Download the weights
 
-A self-contained shell script fetches the seven required files from
-Hugging Face using standard `wget` (or `curl` if `wget` is not available).
-No Python, no Hugging Face CLI, no account required for this public model.
+Use the **ModelScope CLI** to download the model from Alibaba's CDN (usually faster than Hugging Face).
+
+#### Installation
+
+First, ensure the ModelScope package is installed:
 
 ```sh
-./download_model.sh                  # writes to models/Qwen2.5-0.5B/
-./download_model.sh /tmp/my-model    # or any other directory
+pip install modelscope
+```
+
+Or if you're using a virtual environment:
+
+```sh
+source .venv/bin/activate
+pip install modelscope
+```
+
+#### Download command
+
+```sh
+modelscope download --model Qwen/Qwen2.5-0.5B --local_dir ./models/Qwen2.5-0.5B
+```
+
+Or specify a different output directory:
+
+```sh
+modelscope download --model Qwen/Qwen2.5-0.5B --local_dir /tmp/my-model
 ```
 
 Example output:
 
 ```
-Downloading Qwen/Qwen2.5-0.5B into models/Qwen2.5-0.5B/
-  fetch config.json
-config.json                               [ <=>                 ]   1.28K  --.-KB/s    in 0s
-  fetch generation_config.json
-generation_config.json                    [ <=>                 ]     238  --.-KB/s    in 0s
-  fetch tokenizer.json
-tokenizer.json                            [      <=>            ]   6.92M  3.41MB/s    in 2.0s
-  fetch tokenizer_config.json
-tokenizer_config.json                     [ <=>                 ]   7.36K  --.-KB/s    in 0s
-  fetch vocab.json
-vocab.json                                [      <=>            ]   2.78M  4.12MB/s    in 0.7s
-  fetch merges.txt
-merges.txt                                [      <=>            ]   1.66M  3.98MB/s    in 0.4s
-  fetch model.safetensors
-model.safetensors                         [===========================] 988.28M  8.72MB/s    in 1m 53s
-Done.
+Downloading Qwen/Qwen2.5-0.5B...
+Downloading: 100%|████████████| 7/7 [02:15<00:00, 19.27s/it]
+✓ Model downloaded to ./models/Qwen2.5-0.5B/
 ```
 
-Already-downloaded files are skipped, so the script is safe to re-run after
-an interrupted download.
+The download is resumable—if interrupted, re-run the same command to continue.
 
 ### 2 — Build and run
 
